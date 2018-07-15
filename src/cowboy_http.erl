@@ -30,6 +30,7 @@
 	compress_threshold => non_neg_integer(),
 	connection_type => worker | supervisor,
 	env => cowboy_middleware:env(),
+	headers_raw => boolean(),
 	http10_keepalive => boolean(),
 	idle_timeout => timeout(),
 	inactivity_timeout => timeout(),
@@ -72,6 +73,7 @@
 	qs = undefined :: binary(),
 	version = undefined :: cowboy:http_version(),
 	headers = undefined :: cowboy:http_headers() | undefined,
+	headers_raw = undefined :: binary(),
 	name = undefined :: binary() | undefined
 }).
 
@@ -540,8 +542,9 @@ parse_version(_, State, _, _, _, _) ->
 		'Unsupported HTTP version. (RFC7230 2.6)'}).
 
 before_parse_headers(Rest, State, M, A, P, Q, V) ->
+	HR = case maps:get(headers_raw, State#state.opts, false) of true -> <<>>; _ -> undefined end,
 	parse_header(Rest, State#state{in_state=#ps_header{
-		method=M, authority=A, path=P, qs=Q, version=V}}, #{}).
+		method=M, authority=A, path=P, qs=Q, version=V, headers_raw=HR}}, #{}).
 
 %% Headers.
 
@@ -591,6 +594,9 @@ match_colon(<< _, Rest/bits >>, N) ->
 match_colon(_, _) ->
 	nomatch.
 
+parse_hd_name(<< $:, Rest/bits >>, State=#state{in_state=PS=#ps_header{headers_raw=HR0}}, H, SoFar) when is_binary(HR0) ->
+	HR = <<HR0/binary, $:>>,
+	parse_hd_before_value(Rest, State#state{in_state=PS#ps_header{headers_raw=HR}}, H, SoFar);
 parse_hd_name(<< $:, Rest/bits >>, State, H, SoFar) ->
 	parse_hd_before_value(Rest, State, H, SoFar);
 parse_hd_name(<< C, _/bits >>, State=#state{in_state=PS}, H, <<>>) when ?IS_WS(C) ->
@@ -601,12 +607,16 @@ parse_hd_name(<< C, _/bits >>, State=#state{in_state=PS}, H, _) when ?IS_WS(C) -
 	error_terminate(400, State#state{in_state=PS#ps_header{headers=H}},
 		{connection_error, protocol_error,
 			'Whitespace is not allowed between the header name and the colon. (RFC7230 3.2.4)'});
+parse_hd_name(<< C, Rest/bits >>, State=#state{in_state=PS=#ps_header{headers_raw=HR0}}, H, SoFar) when is_binary(HR0) ->
+	HR = <<HR0/binary, C>>,
+	?LOWER(parse_hd_name, Rest, State#state{in_state=PS#ps_header{headers_raw=HR}}, H, SoFar);
 parse_hd_name(<< C, Rest/bits >>, State, H, SoFar) ->
 	?LOWER(parse_hd_name, Rest, State, H, SoFar).
 
-parse_hd_before_value(<< $\s, Rest/bits >>, S, H, N) ->
-	parse_hd_before_value(Rest, S, H, N);
-parse_hd_before_value(<< $\t, Rest/bits >>, S, H, N) ->
+parse_hd_before_value(<< C, Rest/bits >>, S=#state{in_state=PS=#ps_header{headers_raw=HR0}}, H, N) when ?IS_WS(C), is_binary(HR0) ->
+	HR = <<HR0/binary, C>>,
+	parse_hd_before_value(Rest, S#state{in_state=PS#ps_header{headers_raw=HR}}, H, N);
+parse_hd_before_value(<< C, Rest/bits >>, S, H, N) when ?IS_WS(C) ->
 	parse_hd_before_value(Rest, S, H, N);
 parse_hd_before_value(Buffer, State=#state{opts=Opts, in_state=PS}, H, N) ->
 	MaxLength = maps:get(max_header_value_length, Opts, 4096),
@@ -621,7 +631,7 @@ parse_hd_before_value(Buffer, State=#state{opts=Opts, in_state=PS}, H, N) ->
 			parse_hd_value(Buffer, State, H, N, <<>>)
 	end.
 
-parse_hd_value(<< $\r, $\n, Rest/bits >>, S, Headers0, Name, SoFar) ->
+parse_hd_value(<< $\r, $\n, Rest/bits >>, S=#state{in_state=PS=#ps_header{headers_raw=HR0}}, Headers0, Name, SoFar) ->
 	Value = clean_value_ws_end(SoFar, byte_size(SoFar) - 1),
 	Headers = case maps:get(Name, Headers0, undefined) of
 		undefined -> Headers0#{Name => Value};
@@ -629,7 +639,16 @@ parse_hd_value(<< $\r, $\n, Rest/bits >>, S, Headers0, Name, SoFar) ->
 		Value0 when Name =:= <<"cookie">> -> Headers0#{Name => << Value0/binary, "; ", Value/binary >>};
 		Value0 -> Headers0#{Name => << Value0/binary, ", ", Value/binary >>}
 	end,
-	parse_header(Rest, S, Headers);
+	if
+		is_binary(HR0) ->
+			HR = <<HR0/binary, $\r, $\n>>,
+			parse_header(Rest, S#state{in_state=PS#ps_header{headers_raw=HR}}, Headers);
+		true ->
+			parse_header(Rest, S, Headers)
+	end;
+parse_hd_value(<< C, Rest/bits >>, S=#state{in_state=PS=#ps_header{headers_raw=HR0}}, H, N, SoFar) when is_binary(HR0) ->
+	HR = <<HR0/binary, C>>,
+	parse_hd_value(Rest, S#state{in_state=PS#ps_header{headers_raw=HR}}, H, N, << SoFar/binary, C >>);
 parse_hd_value(<< C, Rest/bits >>, S, H, N, SoFar) ->
 	parse_hd_value(Rest, S, H, N, << SoFar/binary, C >>).
 
@@ -714,7 +733,7 @@ default_port(_) -> 80.
 
 request(Buffer, State0=#state{ref=Ref, transport=Transport, peer=Peer, sock=Sock, cert=Cert,
 		proxy_header=ProxyHeader, in_streamid=StreamID, in_state=
-			PS=#ps_header{method=Method, path=Path, qs=Qs, version=Version}},
+			PS=#ps_header{method=Method, path=Path, qs=Qs, version=Version, headers_raw=HeadersRaw}},
 		Headers0, Host, Port) ->
 	Scheme = case Transport:secure() of
 		true -> <<"https">>;
@@ -766,6 +785,7 @@ request(Buffer, State0=#state{ref=Ref, transport=Transport, peer=Peer, sock=Sock
 		%% We are transparently taking care of transfer-encodings so
 		%% the user code has no need to know about it.
 		headers => maps:remove(<<"transfer-encoding">>, Headers),
+		headers_raw => HeadersRaw,
 		has_body => HasBody,
 		body_length => BodyLength
 	},
@@ -790,7 +810,7 @@ request(Buffer, State0=#state{ref=Ref, transport=Transport, peer=Peer, sock=Sock
 		{true, HTTP2Settings} ->
 			%% We save the headers in case the upgrade will fail
 			%% and we need to pass them to cowboy_stream:early_error.
-			http2_upgrade(State0#state{in_state=PS#ps_header{headers=Headers}},
+			http2_upgrade(State0#state{in_state=PS#ps_header{headers=Headers,headers_raw=undefined}},
 				Buffer, HTTP2Settings, Req)
 	end.
 
