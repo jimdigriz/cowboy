@@ -785,7 +785,6 @@ request(Buffer, State0=#state{ref=Ref, transport=Transport, peer=Peer, sock=Sock
 		%% We are transparently taking care of transfer-encodings so
 		%% the user code has no need to know about it.
 		headers => maps:remove(<<"transfer-encoding">>, Headers),
-		headers_raw => HeadersRaw,
 		has_body => HasBody,
 		body_length => BodyLength
 	},
@@ -806,7 +805,7 @@ request(Buffer, State0=#state{ref=Ref, transport=Transport, peer=Peer, sock=Sock
 				false ->
 					State0#state{in_streamid=StreamID + 1, in_state=#ps_request_line{}}
 			end,
-			{request, Req, State#state{buffer=Buffer}};
+			{request, Req#{headers_raw => HeadersRaw}, State#state{buffer=Buffer}};
 		{true, HTTP2Settings} ->
 			%% We save the headers in case the upgrade will fail
 			%% and we need to pass them to cowboy_stream:early_error.

@@ -130,6 +130,7 @@
 	path := binary(),
 	qs := binary(),
 	headers := cowboy:http_headers(),
+	headers_raw := cowboy:http_headers() | binary() | undefined,
 	peer := {inet:ip_address(), inet:port_number()},
 	sock := {inet:ip_address(), inet:port_number()},
 	cert := binary() | undefined,
